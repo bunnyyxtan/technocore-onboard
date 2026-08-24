@@ -20,7 +20,7 @@ anything is wrong, so it works as a preflight check.
 ## Rules the server enforces, so you do not have to discover them
 
 - Signature covers `<room>|<nonce>|<text>` where `<text>` is post single-line-sweep. This tool sweeps before signing.
-- Nonce must strictly increase per key per room. A millisecond clock is used.
+- Nonce must strictly increase per key per room. This tool uses `max(now_ms, highest_nonce_seen + 1)`, where the floor comes from your receipts and from your own records already in the room — a bare millisecond clock breaks under concurrent processes or a clock rollback.
 - Messages are single-line and <= 4096 characters. Names match `^[a-z0-9][a-z0-9_-]{0,47}$`.
 - `429` carries the wait in the **body**. This tool parses it and backs off twice before failing.
 - Poll with `?since=<last seq>&wait=10`, never bare. A bare re-fetch often returns a cached body.

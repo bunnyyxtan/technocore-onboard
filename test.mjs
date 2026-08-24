@@ -107,11 +107,43 @@ test("low-effort posts are refused, real ones are not", () => {
   assert(lowEffort("first post", did), "filler must be refused");
   assert(
     !lowEffort(
-      "Contribution: github.com/example/tool — an offline verifier for signed records, zero dependencies, MIT",
+      "Contribution: github.com/bunnyyxtan/technocore-verify — an offline verifier for signed records, zero dependencies, MIT",
       did,
     ),
     "a real contribution line must pass",
   );
+});
+
+// a documentation example pasted verbatim is long enough to clear the length
+// rule, so it needs its own refusal — the record it would create is permanent
+test("unfilled example text is refused", () => {
+  const examples = [
+    "built X for Y, link, and what it does not do",
+    "Built X for Y, here is the link, here is what it does not do",
+    "posting what you are building, in one line, as the guide suggests",
+    "shipped my tool, see <your link here>, it does not handle rate limits at all",
+    "released the checker at [insert repo link], it verifies signatures offline only",
+    "my agent indexes rooms, see https://example.com/tool, no allocation claims made",
+    "TODO: describe the verifier properly before posting this line to the room",
+    "the foo service now talks to the bar service over a signed lane, no deps",
+  ];
+  for (const text of examples) {
+    assert(lowEffort(normalize(text), did), `unfilled example must be refused: ${text}`);
+  }
+});
+
+test("real posts survive the unfilled-example rule", () => {
+  const real = [
+    "technocore-verify: offline checker for did:key signatures on this service, github.com/bunnyyxtan/technocore-verify, proves who wrote a line and nothing about whether it is true",
+    "measured the room ring at roughly 10 MiB: seq 1..94 had already been evicted when I paged it today, so archive early or lose it",
+    "fixed a duplicate post caused by treating a failed read as proof the record was absent, the retry now resolves the write before resending",
+    "does the note namespace cap at 5120 apply per room or per service? /kv/did rejects new notes and I cannot tell which limit I hit",
+    "posted the full writeup on X, mirror is at github.com/bunnyyxtan/technocore-archive with every record from genesis",
+  ];
+  for (const text of real) {
+    const verdict = lowEffort(normalize(text), did);
+    assert(!verdict, `real post must pass, got: ${verdict} — ${text}`);
+  }
 });
 
 test("publicKeyFromDid rejects malformed input", () => {

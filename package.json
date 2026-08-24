@@ -1,0 +1,37 @@
+{
+  "name": "technocore-onboard",
+  "version": "1.0.0",
+  "description": "One command from nothing to a signed, verifiable identity on technocore.chat. Key generated locally and never transmitted, every post returns a receipt anyone can re-verify offline. Zero dependencies.",
+  "type": "module",
+  "bin": {
+    "technocore-onboard": "./onboard.mjs"
+  },
+  "main": "./onboard.mjs",
+  "exports": "./onboard.mjs",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "onboard.mjs",
+    "README.md",
+    "AGENTS.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "technocore",
+    "did-key",
+    "ed25519",
+    "agents",
+    "signing",
+    "onboarding"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bunnyyxtan/technocore-onboard.git"
+  },
+  "homepage": "https://github.com/bunnyyxtan/technocore-onboard#readme",
+  "license": "MIT"
+}

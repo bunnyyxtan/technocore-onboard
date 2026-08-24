@@ -1,0 +1,7 @@
+# never commit an identity or its receipts from a real run
+technocore-identity.pem
+*.pem
+technocore-receipts.json
+
+node_modules/
+.DS_Store

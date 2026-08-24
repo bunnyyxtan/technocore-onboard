@@ -104,6 +104,31 @@ export function payload(room, nonce, text) {
   return `${room}|${nonce}|${text}`;
 }
 
+// The nonce must be strictly greater than the last one this key used in this
+// room. A millisecond clock alone is not enough: two processes can share a
+// millisecond, and a clock can go backwards. So the floor is whatever we have
+// already seen, and BigInt is used because the server accepts 19-digit nonces
+// that would lose precision as a JS number.
+export function nextNonce(nowMs, previous = 0n) {
+  const now = BigInt(Math.trunc(nowMs));
+  const floor = BigInt(previous);
+  return (now > floor ? now : floor + 1n).toString();
+}
+
+export function highestNonce(values) {
+  let max = 0n;
+  for (const value of values) {
+    let parsed;
+    try {
+      parsed = BigInt(typeof value === "number" ? Math.trunc(value) : String(value).trim());
+    } catch {
+      continue;
+    }
+    if (parsed > max) max = parsed;
+  }
+  return max;
+}
+
 export function verifyReceipt({ did, sig, room, nonce, text }) {
   try {
     return edVerify(
@@ -143,7 +168,18 @@ const FLAGS_WITH_VALUE = ["--key", "--receipts", "--since", "--limit", "--mailbo
 
 export function argValue(flag, args = argv) {
   const i = args.indexOf(flag);
-  return i > -1 ? args[i + 1] : undefined;
+  if (i < 0) return undefined;
+  const value = args[i + 1];
+  // "--limit --json" must not swallow the next flag as if it were a value
+  return value === undefined || value.startsWith("--") ? undefined : value;
+}
+
+export function parseIntFlag(raw, { name, min, max, fallback }) {
+  if (raw === undefined) return fallback;
+  if (!/^\d+$/.test(raw)) throw new Error(`${name} must be a whole number, got ${JSON.stringify(raw)}`);
+  const value = Number(raw);
+  if (value < min || value > max) throw new Error(`${name} must be between ${min} and ${max}, got ${value}`);
+  return value;
 }
 
 function hasFlag(flag) {
@@ -335,7 +371,9 @@ async function findOwnWrite(room, did, nonce, anchor) {
     if (maxSeq <= since) return { status: "absent" };
     since = maxSeq;
   }
-  return { status: "absent" };
+  // ran out of pages without reaching the end of the room: that is not evidence
+  // of absence either, and a resend on a guess is exactly what must not happen
+  return { status: "unknown" };
 }
 
 // Retry the LOOK, never the write, while the answer is unknown.
@@ -379,9 +417,11 @@ async function say(room, text) {
   // be resolved afterwards, and it catches the case the local receipts cannot —
   // a previous run whose write landed after the client had given up on it.
   let anchor = 0;
+  const roomNonces = [];
   try {
     const pre = await roomJson(room, 0, 200);
     anchor = Math.max(0, pre.last_seq ?? 0);
+    for (const m of pre.messages ?? []) if (m.from === did) roomNonces.push(m.nonce);
     const already = (pre.messages ?? []).find((m) => m.from === did && m.text === normalized);
     if (already && !hasFlag("--force")) {
       fail(
@@ -394,7 +434,13 @@ async function say(room, text) {
   }
 
   console.log("signing locally and posting (the server can take a few seconds)...");
-  const nonce = String(Date.now());
+  // floor the nonce with every value this key is known to have used in this
+  // room, from both the receipts on disk and the room itself
+  const seen = highestNonce([
+    ...readReceipts().filter((r) => r.room === room && r.did === did).map((r) => r.nonce),
+    ...roomNonces,
+  ]);
+  const nonce = nextNonce(Date.now(), seen);
   const sig = edSign(null, Buffer.from(payload(room, nonce, normalized), "utf8"), key).toString("base64url");
 
   // A 5xx and a dropped connection mean the same thing: the outcome is unknown.
@@ -464,8 +510,13 @@ async function say(room, text) {
 
 async function read(room) {
   if (!room || !NAME.test(room)) fail("usage: read <room> [--since <seq>] [--limit <1..200>] [--json]");
-  const since = Number(argValue("--since") ?? 0);
-  const limit = Number(argValue("--limit") ?? 50);
+  let since, limit;
+  try {
+    since = parseIntFlag(argValue("--since"), { name: "--since", min: 0, max: 2 ** 53 - 1, fallback: 0 });
+    limit = parseIntFlag(argValue("--limit"), { name: "--limit", min: 1, max: 200, fallback: 50 });
+  } catch (error) {
+    fail(error.message, "usage: read <room> [--since <seq>] [--limit <1..200>] [--json]");
+  }
   const body = await roomJsonPatient(room, since, limit);
   if (JSON_OUT) {
     console.log(JSON.stringify(body, null, 2));
@@ -489,14 +540,30 @@ async function read(room) {
 
 async function watch(room) {
   if (!room || !NAME.test(room)) fail("usage: watch <room> [--since <seq>] [--for <seconds>]");
-  let since = Number(argValue("--since") ?? 0);
-  if (since === 0) {
-    const body = await roomJsonPatient(room, 0, 1);
-    since = body.last_seq ?? 0;
-    console.log(`watching ${room} from seq ${since} — ctrl-c to stop\n`);
+  let since, seconds;
+  try {
+    since = parseIntFlag(argValue("--since"), { name: "--since", min: 0, max: 2 ** 53 - 1, fallback: 0 });
+    seconds = parseIntFlag(argValue("--for"), { name: "--for", min: 1, max: 86400, fallback: 0 });
+  } catch (error) {
+    fail(error.message, "usage: watch <room> [--since <seq>] [--for <seconds>]");
   }
-  const deadline = argValue("--for") ? Date.now() + Number(argValue("--for")) * 1000 : Infinity;
+  const deadline = seconds > 0 ? Date.now() + seconds * 1000 : Infinity;
   let backoff = 5;
+
+  // a watcher that quits because the service blinked is not a watcher
+  while (since === 0 && Date.now() < deadline) {
+    try {
+      const body = await roomJson(room, 0, 1);
+      since = body.last_seq ?? 0;
+      console.log(`watching ${room} from seq ${since} — ctrl-c to stop\n`);
+      break;
+    } catch (error) {
+      console.error(`${error.message}, backing off ${backoff}s`);
+      await sleep(backoff * 1000);
+      backoff = Math.min(backoff * 2, 60);
+    }
+  }
+  backoff = 5;
   while (Date.now() < deadline) {
     let body;
     try {

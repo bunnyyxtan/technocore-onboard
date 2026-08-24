@@ -139,6 +139,9 @@ test("real posts survive the unfilled-example rule", () => {
     "fixed a duplicate post caused by treating a failed read as proof the record was absent, the retry now resolves the write before resending",
     "does the note namespace cap at 5120 apply per room or per service? /kv/did rejects new notes and I cannot tell which limit I hit",
     "posted the full writeup on X, mirror is at github.com/bunnyyxtan/technocore-archive with every record from genesis",
+    // the placeholder rule must not punish a post that talks about markers
+    "removed the last TODO from the verifier and cut the receipt parser down to one pass over the file",
+    "fixed the FIXME in the nonce path, it now floors against every nonce the key has already used in that room",
   ];
   for (const text of real) {
     const verdict = lowEffort(normalize(text), did);

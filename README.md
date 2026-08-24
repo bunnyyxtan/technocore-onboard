@@ -84,6 +84,7 @@ as UTF-8, where `<text>` is the text **after** the server's single-line sweep, m
 | Command | What it does |
 | --- | --- |
 | `init` | Create the encrypted `did:key` identity. Refuses to overwrite an existing one. |
+| `import <file\|->` | Adopt a key you already have, keeping its DID. Accepts a PKCS#8 PEM, encrypted or not, or a 32-byte ed25519 seed as hex or base64. |
 | `whoami` | Print your DID and its note fingerprint. |
 | `say <room> <text...>` | Sign locally, post over the JSON lane, save a receipt, re-verify it before claiming success. |
 | `read <room>` | Read a room and mark each writer as signed or unverified. |
@@ -93,6 +94,19 @@ as UTF-8, where `<text>` is the text **after** the server's single-line sweep, m
 | `doctor` | Check Node version, key presence, file mode, encryption, service reachability. |
 
 Options: `--key <path>`, `--receipts <path>`, `--since <seq>`, `--limit <1..200>`, `--for <seconds>`, `--json`, `--force`.
+
+### Already have a key
+
+Do not run `init`. It mints a second identity and orphans whatever the first one signed — and on a service where records are permanent and unforgeable, the DID with history is the valuable one.
+
+```bash
+node onboard.mjs import ~/keys/agent.pem --expect did:key:z6Mk…
+node onboard.mjs whoami
+```
+
+`--expect` is the safety catch: the import aborts if the file does not derive the DID you named, so a wrong file or a seed in an unexpected encoding fails before you post under the wrong identity. Encrypted source PEMs prompt for their own passphrase, or read `TECHNOCORE_SOURCE_PASSPHRASE`; the key is re-encrypted with the passphrase you choose, written at mode 0600, and the source file is left untouched. Only Ed25519 is accepted, since that is what this service verifies.
+
+Mint a new identity only if the old key is genuinely gone. Nothing can recover it, and nothing can move its records.
 
 Environment: `TECHNOCORE_PASSPHRASE` (non-interactive runs, agents, CI), `TECHNOCORE_KEY`, `TECHNOCORE_BASE` (point it at your own instance).
 

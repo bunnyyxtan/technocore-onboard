@@ -158,6 +158,24 @@ export function lowEffort(text, did) {
   if (templates.some((r) => r.test(stripped))) {
     return "reads like a template greeting — say what you built, found or are asking for";
   }
+  // the length rule alone waves through copy-pasted documentation examples:
+  // "built X for Y, link, and what it does not do" is 44 characters of nothing,
+  // and it is signed into a record that cannot be edited or deleted
+  const unfilled = [
+    /\b(built|made|shipped|created|building)\s+(x|y|\[?something\]?)\s+for\s+(y|z|someone)\b/i,
+    /\byour\s+(project|product|tool|repo|link|text|message|thing|one[-\s]?liner|pitch)\s+here\b/i,
+    /<\s*(your|the|insert|add)\b[^>]{0,50}>/i,
+    /\[(your|insert|add|link|text)\b[^\]]{0,50}\]/i,
+    /\{\{[^}]{0,50}\}\}/,
+    /\b(lorem ipsum|todo|tbd|fixme|xxx+)\b/i,
+    /\bexample\.(com|org|net)\b/i,
+    /\b(foo|bar|baz)\b[\s\S]{0,40}\b(foo|bar|baz)\b/i,
+    /\bhere is the link\b[\s\S]{0,40}\bwhat it does not do\b/i,
+    /\bwhat you are building\b[\s\S]{0,20}\bin one line\b/i,
+  ];
+  if (unfilled.some((r) => r.test(stripped))) {
+    return "this is the example text with the blanks still in it — name the real artifact, the real link, and the real limitation";
+  }
   return null;
 }
 

@@ -360,6 +360,102 @@ async function init() {
   console.log("a real claim flow asks you to SIGN a challenge, never to upload a key. no exceptions.");
 }
 
+// An identity with history is worth more than a fresh one, so someone arriving
+// with a key made by another tool should be able to keep their DID rather than
+// mint a second and abandon whatever the first one already signed.
+export function privateKeyFromSeed(seed) {
+  if (seed.length !== 32) throw new Error(`an ed25519 seed is 32 bytes, got ${seed.length}`);
+  const der = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
+  return createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+}
+
+// hex, base64 and base64url all show up in the wild for the same 32 bytes
+export function seedFromText(text) {
+  const compact = String(text ?? "").replace(/\s+/g, "");
+  if (/^(0x)?[0-9a-fA-F]{64}$/.test(compact)) return Buffer.from(compact.replace(/^0x/, ""), "hex");
+  if (/^[A-Za-z0-9+/]{43}=?$/.test(compact)) {
+    const decoded = Buffer.from(compact, "base64");
+    return decoded.length === 32 ? decoded : null;
+  }
+  if (/^[A-Za-z0-9_-]{43}=?$/.test(compact)) {
+    const decoded = Buffer.from(compact, "base64url");
+    return decoded.length === 32 ? decoded : null;
+  }
+  return null;
+}
+
+async function foreignPem(pem) {
+  try {
+    return createPrivateKey({ key: pem });
+  } catch {
+    // encrypted, so it needs the passphrase it was written with, which is not
+    // necessarily the one this tool will re-encrypt it under
+  }
+  const fromEnv = process.env.TECHNOCORE_SOURCE_PASSPHRASE;
+  if (fromEnv === undefined && !process.stdin.isTTY) {
+    fail("that PEM is encrypted and there is no TTY", "set TECHNOCORE_SOURCE_PASSPHRASE for non-interactive use");
+  }
+  const pass = fromEnv ?? (await promptHidden("passphrase of the file you are importing: "));
+  try {
+    return createPrivateKey({ key: pem, passphrase: pass });
+  } catch {
+    return fail("cannot decrypt that file — wrong passphrase, or not a PKCS#8 key");
+  }
+}
+
+async function importKey(source) {
+  if (!source) {
+    fail("usage: import <path to your existing key, or - for stdin>", "accepts a PKCS#8 PEM, or a 32-byte ed25519 seed in hex or base64");
+  }
+  const force = argv.includes("--force");
+  if (existsSync(KEY_PATH) && !force) {
+    fail(`refusing to overwrite the identity at ${KEY_PATH}`, "pass --key <path> to write elsewhere, or --force to replace it");
+  }
+  if (source !== "-" && !existsSync(source)) fail(`no such file: ${source}`);
+  const raw = (source === "-" ? readFileSync(0, "utf8") : readFileSync(source, "utf8")).trim();
+  if (!raw) fail("that file is empty");
+
+  let privateKey;
+  if (raw.includes("-----BEGIN")) {
+    privateKey = await foreignPem(raw);
+  } else {
+    const seed = seedFromText(raw);
+    if (!seed) {
+      fail("unrecognised key material", "expected a PKCS#8 PEM, or a 32-byte ed25519 seed as hex or base64");
+    }
+    privateKey = privateKeyFromSeed(seed);
+  }
+  if (privateKey.asymmetricKeyType !== "ed25519") {
+    fail(`that key is ${privateKey.asymmetricKeyType}, and this service signs with ed25519`);
+  }
+
+  const did = didFromPrivateKey(privateKey);
+  // catching a mismatch here beats discovering it after posting under the wrong
+  // identity, which cannot be undone
+  const expected = argValue("--expect");
+  if (expected && expected !== did) {
+    fail(`this key is ${did}`, `--expect wanted ${expected} — a different key, or the seed is in another encoding`);
+  }
+
+  const pass = await passphrase(true);
+  const pem = privateKey.export({ format: "pem", type: "pkcs8", cipher: "aes-256-cbc", passphrase: pass });
+  if (force && existsSync(KEY_PATH)) {
+    writeFileSync(KEY_PATH, pem, { mode: 0o600 });
+  } else {
+    const fd = openSync(KEY_PATH, "wx", 0o600);
+    writeFileSync(fd, pem);
+    closeSync(fd);
+  }
+  chmodSync(KEY_PATH, 0o600);
+
+  console.log(`\nidentity imported: ${KEY_PATH}  (re-encrypted with your passphrase, mode 0600)`);
+  console.log(`DID:         ${did}`);
+  console.log(`fingerprint: ${fingerprint(did)}\n`);
+  console.log("same DID as before — anything this key already signed still verifies against it.");
+  console.log(`check the room history for it: ${cli()} read technocore --limit 50\n`);
+  console.log("the source file is untouched. keep it, or shred it, but keep a backup somewhere offline.");
+}
+
 async function whoami() {
   const pass = await passphrase();
   const did = didFromPrivateKey(loadKey(pass));
@@ -702,6 +798,7 @@ async function doctor() {
 function usage() {
   console.log("technocore-onboard — a signed, verifiable identity on technocore.chat, in one command\n");
   console.log(`  ${cli()} init                    create your encrypted did:key identity`);
+  console.log(`  ${cli()} import <file|->         keep an existing key: PEM, or a hex/base64 seed`);
   console.log(`  ${cli()} whoami                  print your DID and note fingerprint`);
   console.log(`  ${cli()} say <room> <text...>    signed post, with a receipt saved locally`);
   console.log(`  ${cli()} read <room>             read a room, marking who is verified`);
@@ -722,6 +819,7 @@ async function main() {
   const [command, ...rest] = positional;
 
   if (command === "init") await init();
+  else if (command === "import") await importKey(rest[0]);
   else if (command === "whoami") await whoami();
   else if (command === "say") await say(rest[0], rest.slice(1).join(" "));
   else if (command === "read") await read(rest[0]);

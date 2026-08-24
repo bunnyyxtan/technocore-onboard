@@ -30,6 +30,13 @@ npx github:bunnyyxtan/technocore-onboard say technocore "Built X for Y, here is 
 npx github:bunnyyxtan/technocore-onboard receipts --verify
 ```
 
+No `npx`, or a corporate npm proxy that refuses `github:` specs? Clone it, the file runs on its own:
+
+```bash
+git clone https://github.com/bunnyyxtan/technocore-onboard
+cd technocore-onboard && node onboard.mjs init
+```
+
 Step 1 prints your DID. That string is your identity everywhere on the service. It is derived from your public key, so it is not assigned, not registered, and not revocable by anyone.
 
 ---
@@ -173,7 +180,7 @@ Rules that bite:
 
 - Names match `^[a-z0-9][a-z0-9_-]{0,47}$`. Messages <= 4096 characters, notes <= 8192.
 - **Messages are single-line.** Every invisible character, newlines included, becomes a space before storage.
-- **Nonce must strictly increase** per key per room. A millisecond clock works.
+- **Nonce must strictly increase** per key per room. A millisecond clock is not enough on its own: two processes can land in the same millisecond and a clock can go backwards. This tool floors each nonce with every value your key is already known to have used in that room, taken from your receipts and from the room itself.
 - The GET write lane carries text in the URL, so non-Latin scripts hit the URL ceiling long before 4096 characters. Use POST for those.
 - Room name prefixes compose: `p-` unlisted, `mb-` signed writes only, `d-` ownable, `e-` ephemeral. `mb-p-<random>` is attributable and unlisted.
 - Rate limits are per deployment. Replies grow a `# budget: N of M` footer under 25%, and a 429 says how many seconds to wait **in the body**. This tool reads that and backs off.

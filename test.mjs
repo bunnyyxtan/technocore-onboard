@@ -3,12 +3,16 @@
 
 import { generateKeyPairSync, sign as edSign } from "node:crypto";
 import {
+  argValue,
   base58btcDecode,
   base58btcEncode,
   didFromPrivateKey,
   fingerprint,
+  highestNonce,
   lowEffort,
+  nextNonce,
   normalize,
+  parseIntFlag,
   payload,
   publicKeyFromDid,
   verifyReceipt,
@@ -119,6 +123,43 @@ test("publicKeyFromDid rejects malformed input", () => {
       threw = true;
     }
     assert(threw, `expected a throw for ${JSON.stringify(bad)}`);
+  }
+});
+
+test("nonce is strictly increasing even when the clock is not", () => {
+  // same millisecond, two processes: the second must not reuse the nonce
+  assert(nextNonce(1700000000000, 0n) === "1700000000000", "a clean clock should be used as-is");
+  assert(nextNonce(1700000000000, 1700000000000n) === "1700000000001", "an equal nonce must be stepped past");
+  assert(nextNonce(1600000000000, 1700000000000n) === "1700000000001", "a clock rollback must not lower the nonce");
+  let previous = 0n;
+  for (let i = 0; i < 5; i++) {
+    const issued = BigInt(nextNonce(1700000000000, previous));
+    assert(issued > previous, `nonce ${issued} did not exceed ${previous}`);
+    previous = issued;
+  }
+});
+
+test("nonce floor survives values too large for a JS number", () => {
+  // the service accepts 19-digit nonces, which lose precision as doubles
+  const huge = "1787596185534125639";
+  assert(highestNonce([huge, "12", 7]).toString() === huge, "BigInt floor lost the largest value");
+  assert(nextNonce(1700000000000, highestNonce([huge])) === "1787596185534125640", "did not step past a huge nonce");
+  assert(highestNonce(["", "not-a-number", null, undefined, "42"]).toString() === "42", "garbage must be skipped");
+});
+
+test("value flags reject junk and never swallow the next flag", () => {
+  assert(argValue("--limit", ["read", "x", "--limit", "--json"]) === undefined, "--limit ate the following flag");
+  assert(argValue("--limit", ["read", "x", "--limit", "25"]) === "25", "a real value was not read");
+  assert(argValue("--limit", ["read", "x", "--limit"]) === undefined, "a trailing flag has no value");
+  assert(parseIntFlag(undefined, { name: "--limit", min: 1, max: 200, fallback: 50 }) === 50, "fallback ignored");
+  for (const bad of ["abc", "-5", "1.5", "999"]) {
+    let threw = false;
+    try {
+      parseIntFlag(bad, { name: "--limit", min: 1, max: 200, fallback: 50 });
+    } catch {
+      threw = true;
+    }
+    assert(threw, `expected a throw for --limit ${JSON.stringify(bad)}`);
   }
 });
 

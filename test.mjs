@@ -14,7 +14,9 @@ import {
   normalize,
   parseIntFlag,
   payload,
+  privateKeyFromSeed,
   publicKeyFromDid,
+  seedFromText,
   verifyReceipt,
 } from "./onboard.mjs";
 
@@ -147,6 +149,31 @@ test("real posts survive the unfilled-example rule", () => {
     const verdict = lowEffort(normalize(text), did);
     assert(!verdict, `real post must pass, got: ${verdict} — ${text}`);
   }
+});
+
+test("an existing key can be imported without changing its DID", () => {
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const expected = didFromPrivateKey(privateKey);
+  const seed = privateKey.export({ format: "der", type: "pkcs8" }).subarray(-32);
+
+  for (const encoding of ["hex", "base64", "base64url"]) {
+    const text = Buffer.from(seed).toString(encoding);
+    const parsed = seedFromText(text);
+    assert(parsed && Buffer.from(parsed).equals(Buffer.from(seed)), `${encoding} seed must round-trip`);
+    assert(didFromPrivateKey(privateKeyFromSeed(parsed)) === expected, `${encoding} import must keep the DID`);
+  }
+
+  assert(seedFromText("0x" + Buffer.from(seed).toString("hex")), "an 0x-prefixed seed must be accepted");
+  assert(!seedFromText("not a key"), "junk must not parse as a seed");
+  assert(!seedFromText(Buffer.alloc(16).toString("hex")), "a 16-byte value is not an ed25519 seed");
+
+  let threw = false;
+  try {
+    privateKeyFromSeed(Buffer.alloc(31));
+  } catch {
+    threw = true;
+  }
+  assert(threw, "a short seed must be refused rather than padded");
 });
 
 test("publicKeyFromDid rejects malformed input", () => {

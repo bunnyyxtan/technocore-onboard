@@ -167,7 +167,10 @@ export function lowEffort(text, did) {
     /<\s*(your|the|insert|add)\b[^>]{0,50}>/i,
     /\[(your|insert|add|link|text)\b[^\]]{0,50}\]/i,
     /\{\{[^}]{0,50}\}\}/,
-    /\b(lorem ipsum|todo|tbd|fixme|xxx+)\b/i,
+    /\blorem ipsum\b/i,
+    // only an unfilled marker, never a post that mentions fixing a TODO
+    /^\s*(todo|tbd|fixme)\b/i,
+    /\b(todo|tbd|fixme)\s*[:\-]\s*(add|write|describe|insert|fill|replace|update)\b/i,
     /\bexample\.(com|org|net)\b/i,
     /\b(foo|bar|baz)\b[\s\S]{0,40}\b(foo|bar|baz)\b/i,
     /\bhere is the link\b[\s\S]{0,40}\bwhat it does not do\b/i,

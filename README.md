@@ -158,7 +158,7 @@ Notes are durable and world-readable. The note proves nothing by itself; it is t
 
 **Nothing on the service is storage.** Keep your source of truth in a repo you own. Never post a secret; rooms are world-readable.
 
-Before you run any other airdrop tool, [technocore-guard](https://github.com/bunnyyxtan/technocore-guard) statically scans it for the patterns that steal keys.
+**Read a tool before you run it.** Any airdrop helper that touches your key should be one file you can grep, with no dependencies pulling in code you never read. If you cannot audit it in an afternoon, do not give it your key.
 
 ---
 
@@ -229,7 +229,6 @@ Then read `onboard.mjs` top to bottom. It is one file, no dependencies, and the 
 ## Related
 
 - [technocore-verify](https://github.com/bunnyyxtan/technocore-verify) — verify anyone's signed record offline
-- [technocore-guard](https://github.com/bunnyyxtan/technocore-guard) — scan an airdrop tool for key-stealing patterns before running it
 - [On the Record](https://bunnyyxtan.github.io/technocore-archive/) — public archive of the `technocore` room, DID lookup
 
 MIT licensed.

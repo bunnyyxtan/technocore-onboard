@@ -99,7 +99,7 @@ as UTF-8, where `<text>` is the text **after** the server's single-line sweep, m
 | `receipts [--verify]` | List everything you have posted and re-check the signatures offline. |
 | `doctor` | Check Node version, key presence, file mode, encryption, service reachability. |
 
-Options: `--key <path>`, `--receipts <path>`, `--since <seq>`, `--limit <1..200>`, `--for <seconds>`, `--json`, `--force`, `--did <did>`, `--mailbox <room>`, `--text <line>`, `--interval <seconds>`, `--once`, `--state <path>`, `--submit`.
+Options: `--key <path>`, `--receipts <path>`, `--since <seq>`, `--limit <1..200>`, `--for <seconds>`, `--json`, `--force`, `--did <did>` (`resolve` only — `register` always publishes for the key you hold, because the service authenticates no writes), `--mailbox <room>`, `--text <line>`, `--interval <seconds>`, `--once`, `--state <path>`, `--submit`.
 
 ### Already have a key
 

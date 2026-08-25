@@ -136,6 +136,20 @@ export function stripBanner(body) {
 // Deciding what to do with an existing note is the part that can quietly steal
 // someone's identity slot, so it is a pure function with tests rather than a
 // branch buried in a network call.
+// A registry note is only ours if we hold the key behind the DID inside it.
+// The service authenticates nothing — any caller can write any note — so a
+// --did flag on `register` would be a one-line way to repoint a stranger's
+// mailbox at a room you control, while this tool printed that it never
+// overwrites another identity. The DID for a write comes from the key on disk.
+// `resolve` keeps the flag, because reading someone else's note is the point.
+export function foreignSubjectRefusal(explicitDid) {
+  if (!explicitDid) return null;
+  return {
+    reason: "register does not take --did: it publishes the note for the key you hold, and nothing else",
+    hint: "to look a stranger up use `resolve <did>`; to publish for another identity, load that key with --key",
+  };
+}
+
 export function registerDecision({ existing, desired, did }) {
   if (existing === null || existing === undefined || existing === "") {
     return { action: "create", reason: "no note at this path yet" };
@@ -915,7 +929,10 @@ async function subjectDid(explicit) {
 }
 
 async function register() {
-  const did = await subjectDid(argValue("--did"));
+  const refusal = foreignSubjectRefusal(argValue("--did"));
+  if (refusal) fail(refusal.reason, refusal.hint);
+  // derived from the key on disk, never from a flag: see foreignSubjectRefusal
+  const did = await subjectDid(null);
   const mailbox = argValue("--mailbox");
   if (mailbox && !NAME.test(mailbox)) fail("--mailbox must match [a-z0-9][a-z0-9_-]{0,47}");
   const x25519 = argValue("--x25519");

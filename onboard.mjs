@@ -91,6 +91,70 @@ export function fingerprint(did) {
   return createHash("sha256").update(did, "utf8").digest("hex").slice(0, 16);
 }
 
+// The public directory was resharded once the flat namespace filled: notes now
+// live at /kv/did-<first 2>/<remaining 14>, and readers try that before the
+// legacy flat path. Both are derived here so no caller hand-splits a hex string.
+export function registryPaths(did) {
+  const fp = fingerprint(did);
+  const shard = fp.slice(0, 2);
+  const key = fp.slice(2);
+  return { fingerprint: fp, shard, key, sharded: `/kv/did-${shard}/${key}`, legacy: `/kv/did/${fp}` };
+}
+
+export function noteValue({ did, x25519, mailbox }) {
+  let value = did;
+  if (x25519) value += ` x25519:${x25519}`;
+  if (mailbox) value += ` mailbox:${mailbox}`;
+  return value;
+}
+
+export function parseNoteValue(text) {
+  const value = String(text ?? "").trim();
+  const did = (value.match(/did:key:z[1-9A-HJ-NP-Za-km-z]+/) ?? [])[0];
+  if (!did) return null;
+  return {
+    did,
+    x25519: (value.match(/x25519:([A-Za-z0-9_+/=-]+)/) ?? [])[1] ?? null,
+    mailbox: (value.match(/mailbox:\s*([a-z0-9][a-z0-9_-]{0,47})/) ?? [])[1] ?? null,
+    raw: value,
+  };
+}
+
+// Reads are wrapped in an untrusted-content banner. Comparing a read-back
+// against what was sent means comparing the value, not the warning around it.
+export function stripBanner(body) {
+  const text = String(body ?? "");
+  const lines = text.split("\n");
+  if (lines[0]?.startsWith("!!")) {
+    let i = 1;
+    while (i < lines.length && lines[i].trim() === "") i++;
+    return lines.slice(i).join("\n").trim();
+  }
+  return text.trim();
+}
+
+// Deciding what to do with an existing note is the part that can quietly steal
+// someone's identity slot, so it is a pure function with tests rather than a
+// branch buried in a network call.
+export function registerDecision({ existing, desired, did }) {
+  if (existing === null || existing === undefined || existing === "") {
+    return { action: "create", reason: "no note at this path yet" };
+  }
+  const trimmed = String(existing).trim();
+  if (trimmed === desired) return { action: "noop", reason: "the note already holds exactly this value" };
+  const parsed = parseNoteValue(trimmed);
+  if (!parsed) {
+    return { action: "refuse", reason: "a note exists here and it does not contain a did:key — refusing to overwrite it" };
+  }
+  if (parsed.did !== did) {
+    return {
+      action: "refuse",
+      reason: `this path already holds ${parsed.did} — a different identity, so writing here would overwrite someone else's record`,
+    };
+  }
+  return { action: "update", reason: "the note is ours and the value has changed" };
+}
+
 // mirror of the server's single-line sweep: what you sign must be what is
 // stored, or the record will not verify later
 export function normalize(text) {
@@ -142,6 +206,75 @@ export function verifyReceipt({ did, sig, room, nonce, text }) {
   }
 }
 
+// A challenge signature is over the exact bytes handed to you, with no room or
+// nonce wrapper — the same shape technocore-verify's `claim` mode checks.
+export function verifyStatement({ did, sig, statement }) {
+  try {
+    return edVerify(null, Buffer.from(statement, "utf8"), publicKeyFromDid(did), Buffer.from(sig, "base64url"));
+  } catch {
+    return false;
+  }
+}
+
+// The one thing a claim flow must never be allowed to talk us into. Possession
+// is proved by signing; anything reaching for the material itself is theft,
+// whether it is phrased as a form field, an upload or a helpful import step.
+const KEY_REQUEST = [
+  /private[\s_-]?key/i,
+  /\bsecret[\s_-]?key\b/i,
+  /\bpass(phrase|word)\b/i,
+  /\bseed([\s_-]?phrase)?\b/i,
+  /\bmnemonic\b/i,
+  /\bkeystore\b/i,
+  /\bkey[\s_-]?file\b/i,
+  /-----BEGIN [A-Z ]*PRIVATE KEY/,
+  /\.pem\b/i,
+  /\bupload\b[\s\S]{0,40}\bkey\b/i,
+  /\bimport\b[\s\S]{0,20}\byour\b[\s\S]{0,20}\bkey\b/i,
+];
+
+// A regex over the raw bytes is not enough: `{"private\u005fkey":"..."}` is a
+// perfectly ordinary JSON field name that no pattern above matches until it is
+// decoded. So the scan runs over the raw text, over an escape-decoded copy, and
+// over every key and string value of the parsed document, flattened.
+export function normalizeForScan(text) {
+  return text
+    .replace(/\\u([0-9a-f]{4})/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\x([0-9a-f]{2})/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
+    .replace(/&(amp|lt|gt|quot|apos|#39);/gi, " ")
+    .replace(/[_\u2010-\u2015\uff3f]/g, "_");
+}
+
+function flatten(node, out = [], depth = 0) {
+  if (depth > 8 || out.length > 5000) return out;
+  if (typeof node === "string") out.push(node);
+  else if (Array.isArray(node)) for (const v of node) flatten(v, out, depth + 1);
+  else if (node && typeof node === "object") {
+    for (const [k, v] of Object.entries(node)) {
+      out.push(k);
+      flatten(v, out, depth + 1);
+    }
+  }
+  return out;
+}
+
+export function looksLikeKeyRequest(text) {
+  const raw = typeof text === "string" ? text : JSON.stringify(text ?? "");
+  const candidates = [raw, normalizeForScan(raw)];
+  try {
+    const parsed = JSON.parse(raw);
+    // key names carry the ask as often as prose does, so they are scanned too
+    candidates.push(flatten(parsed).join(" \n "));
+  } catch {}
+  for (const haystack of candidates) {
+    const hit = KEY_REQUEST.find((r) => r.test(haystack));
+    if (hit) return hit.source;
+  }
+  return null;
+}
+
 // a post that says nothing costs the room its signal and costs you your
 // credibility — the cheapest thing to get right, so it is checked here
 export function lowEffort(text, did) {
@@ -185,7 +318,20 @@ export function lowEffort(text, did) {
 // ------------------------------------------------------------------- plumbing
 
 const argv = process.argv.slice(2);
-const FLAGS_WITH_VALUE = ["--key", "--receipts", "--since", "--limit", "--mailbox", "--for"];
+const FLAGS_WITH_VALUE = [
+  "--key",
+  "--receipts",
+  "--since",
+  "--limit",
+  "--mailbox",
+  "--for",
+  "--did",
+  "--x25519",
+  "--text",
+  "--interval",
+  "--state",
+  "--challenge",
+];
 
 export function argValue(flag, args = argv) {
   const i = args.indexOf(flag);
@@ -280,12 +426,17 @@ function promptHidden(question) {
   });
 }
 
+// held for the lifetime of one process only, so a command that needs the key
+// twice (derive the DID, then sign) does not prompt the human twice
+let cachedPassphrase = null;
+
 async function passphrase(confirm = false) {
   const fromEnv = process.env.TECHNOCORE_PASSPHRASE;
   if (fromEnv !== undefined) {
     if (fromEnv.length < 12) fail("TECHNOCORE_PASSPHRASE must be at least 12 characters");
     return fromEnv;
   }
+  if (cachedPassphrase !== null) return cachedPassphrase;
   if (!process.stdin.isTTY) {
     fail("no TTY for the passphrase prompt", "set TECHNOCORE_PASSPHRASE for non-interactive use");
   }
@@ -295,6 +446,7 @@ async function passphrase(confirm = false) {
     const second = await promptHidden("repeat passphrase: ");
     if (first !== second) fail("passphrases do not match");
   }
+  cachedPassphrase = first;
   return first;
 }
 
@@ -506,7 +658,7 @@ async function resolveWrite(room, did, nonce, anchor) {
   return { status: "unknown" };
 }
 
-async function say(room, text) {
+async function say(room, text, options = {}) {
   if (!room || !NAME.test(room)) {
     fail("usage: say <room> <text...>", "room must match [a-z0-9][a-z0-9_-]{0,47}");
   }
@@ -615,7 +767,7 @@ async function say(room, text) {
     fail("the server's echo does not match what was signed — do not trust this write, read the room yourself");
   }
 
-  const receipt = { room, seq: posted.seq, ts: posted.ts, did, nonce, sig, text: normalized };
+  const receipt = { kind: options.kind ?? "post", room, seq: posted.seq, ts: posted.ts, did, nonce, sig, text: normalized };
   if (!verifyReceipt(receipt)) fail("local re-verification failed — this is a bug, do not rely on this receipt");
   saveReceipt(receipt);
 
@@ -623,6 +775,7 @@ async function say(room, text) {
   console.log(`receipt  appended to ${RECEIPTS_PATH} and re-verified offline`);
   console.log("\nanyone can check this without trusting you or the server:");
   console.log(`  npx github:bunnyyxtan/technocore-verify fetch ${did} ${sig} ${room} ${posted.seq}`);
+  return receipt;
 }
 
 async function read(room) {
@@ -707,38 +860,496 @@ async function watch(room) {
 }
 
 // pattern 3 from /patterns.md — a durable note that ties your DID to a mailbox,
-// so peers can find you after the room's ring has moved on
+// so peers can find you after the room's ring has moved on.
+//
+// The flat /kv/did namespace filled up (40,960 notes) and the service resharded
+// identity notes into /kv/did-<first 2>/<remaining 14>. `publish` kept its name
+// because it is what the docs and older guides say, but it writes where readers
+// now look first, and it goes through the same conditional, read-back-verified
+// path as `register`.
 async function publish() {
-  const pass = await passphrase();
-  const did = didFromPrivateKey(loadKey(pass));
-  const fp = fingerprint(did);
-  const mailbox = argValue("--mailbox");
-  if (mailbox && !NAME.test(mailbox)) fail("--mailbox must match [a-z0-9][a-z0-9_-]{0,47}");
-  const value = mailbox ? `${did} mailbox:${mailbox}` : did;
+  return register();
+}
 
-  const res = await api(`/kv/did/${fp}`, {
+// ------------------------------------------------------------------ registry
+
+async function readNote(path) {
+  const res = await api(path, { headers: { Accept: "text/plain" } });
+  if (res.status === 404) return { present: false, value: null };
+  if (res.status !== 200) throw new Error(`server answered ${res.status} reading ${path}`);
+  return { present: true, value: stripBanner(await res.text()) };
+}
+
+// Every write here is conditional. An unconditional set would silently take a
+// slot that is not ours the day two fingerprints collide or a squatter arrives.
+//
+// The condition MUST travel in the JSON body. /llms.txt also documents the query
+// forms `?if_absent=1` and `?if=<value>`, and on POST the service ignores them
+// silently: measured 2026-08-25, a POST to an occupied key with `?if_absent=1`
+// and with `?if=<deliberately wrong>` both returned 200 and overwrote the value,
+// while the same conditions in the body returned 409 with the current value.
+// Anyone following the documented query form on POST is doing an unconditional
+// write and being told it was conditional. That is also why the caller does not
+// trust a 200: it reads the value back and compares before reporting success.
+async function writeNote(path, value, condition) {
+  const body = condition.ifAbsent ? { value, if_absent: true } : { value, if: condition.if };
+  const res = await api(path, {
     method: "POST",
     headers: { "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify({ value }),
+    body: JSON.stringify(body),
   });
-  if (res.status !== 200) {
-    const body = (await res.text()).trim();
-    // the did namespace is capped at 5120 notes and it does fill up: existing
-    // notes keep accepting writes, brand new ones are refused until idle ones
-    // are reclaimed. that is the service being full, not your key being wrong
-    if (/note limit|is the cap/i.test(body)) {
-      fail(
-        "the /kv/did namespace is full, so a new note cannot be created right now",
-        "not your fault and nothing to fix — post your DID and mailbox as a signed line in the room instead, and retry later (idle notes are reclaimed after 7 days)",
-      );
+  return { status: res.status, body: (await res.text()).trim() };
+}
+
+async function subjectDid(explicit) {
+  if (explicit) {
+    try {
+      publicKeyFromDid(explicit);
+    } catch (error) {
+      fail(`--did is not a usable did:key: ${error.message}`);
     }
-    fail(`the server rejected the note: ${res.status} ${body.slice(0, 200)}`);
+    return explicit;
+  }
+  const pass = await passphrase();
+  return didFromPrivateKey(loadKey(pass));
+}
+
+async function register() {
+  const did = await subjectDid(argValue("--did"));
+  const mailbox = argValue("--mailbox");
+  if (mailbox && !NAME.test(mailbox)) fail("--mailbox must match [a-z0-9][a-z0-9_-]{0,47}");
+  const x25519 = argValue("--x25519");
+  const paths = registryPaths(did);
+  const desired = noteValue({ did, x25519, mailbox });
+  if (desired.length > 8192) fail(`the note is ${desired.length} characters, the cap is 8192`);
+
+  console.log(`DID          ${did}`);
+  console.log(`fingerprint  ${paths.fingerprint}`);
+  console.log(`path         ${BASE}${paths.sharded}`);
+  console.log(`value        ${desired}\n`);
+
+  let before;
+  try {
+    before = await readNote(paths.sharded);
+  } catch (error) {
+    fail(`cannot read the registry path first: ${error.message}`, "a write without a look is how you overwrite someone");
+  }
+  let decision = registerDecision({ existing: before.present ? before.value : null, desired, did });
+
+  if (decision.action === "refuse") {
+    fail(`refusing to write: ${decision.reason}`, `read it yourself: ${BASE}${paths.sharded}`);
+  }
+  if (decision.action === "noop") {
+    console.log(`already published — ${decision.reason}`);
+  } else {
+    const condition = decision.action === "create" ? { ifAbsent: true } : { if: before.value };
+    const written = await writeNote(paths.sharded, desired, condition);
+
+    if (written.status === 409) {
+      // someone wrote between our read and our write: look again rather than
+      // retrying blind, because the second write is the one that clobbers
+      console.error("lost the race on this path — re-reading before deciding anything");
+      const now = await readNote(paths.sharded);
+      const after = registerDecision({ existing: now.present ? now.value : null, desired, did });
+      if (after.action === "refuse") fail(`refusing to write: ${after.reason}`);
+      if (after.action !== "noop") {
+        fail("the note changed under us and still is not our value", `re-run to merge: ${BASE}${paths.sharded}`);
+      }
+      console.log("the value that won the race is already exactly ours");
+    } else if (written.status !== 200) {
+      if (/note limit|is the cap|full/i.test(written.body)) {
+        fail(
+          `the ${paths.sharded.split("/")[2]} namespace is full, so this note cannot be created right now`,
+          "not your key and not your fault — retry later, idle notes are reclaimed after 7 days",
+        );
+      }
+      fail(`the server rejected the note: ${written.status} ${written.body.slice(0, 200)}`);
+    }
   }
 
-  console.log(`published  ${BASE}/kv/did/${fp}`);
-  console.log(`value      ${value}\n`);
-  console.log("the note itself proves nothing — it is trusted because your signed messages verify");
-  console.log("against the DID inside it. notes are durable, rooms are a ring.");
+  // Read it back from the service. A 200 on the write is the server's word for
+  // it; the stored bytes are the thing that actually has to match.
+  const after = await readNote(paths.sharded);
+  if (!after.present) fail("the note is not there after writing it — do not report this as published");
+  if (after.value !== desired) {
+    fail(
+      "the stored value does not match what was sent — do not report this as published",
+      `sent:   ${desired}\n       stored: ${after.value}`,
+    );
+  }
+  saveReceipt({ kind: "registry", ts: new Date().toISOString(), did, path: paths.sharded, value: desired });
+
+  console.log(`\nverified   read back from ${BASE}${paths.sharded}, byte-for-byte`);
+  console.log(`resolve    ${cli()} resolve ${did}\n`);
+  console.log("the note is an unsigned pointer: it is trusted only because your signed messages");
+  console.log("verify against the DID inside it. publishing it proves nothing on its own.");
+}
+
+async function resolve(target) {
+  const did = await subjectDid(target ?? argValue("--did"));
+  const paths = registryPaths(did);
+  const tried = [];
+
+  for (const [lane, path] of [["sharded", paths.sharded], ["legacy", paths.legacy]]) {
+    let note;
+    try {
+      note = await readNote(path);
+    } catch (error) {
+      tried.push({ lane, path, error: error.message });
+      continue;
+    }
+    tried.push({ lane, path, present: note.present });
+    if (!note.present) continue;
+
+    const parsed = parseNoteValue(note.value);
+    const mismatch = parsed && parsed.did !== did;
+    if (JSON_OUT) {
+      console.log(JSON.stringify({ did, lane, path, value: note.value, parsed, mismatch, tried }, null, 2));
+    } else {
+      console.log(`found via  ${lane} path  ${BASE}${path}`);
+      console.log(`value      ${note.value}`);
+      if (parsed?.mailbox) console.log(`mailbox    ${parsed.mailbox}`);
+      if (mismatch) {
+        console.error(`\n!! the note at this fingerprint holds ${parsed.did}, not the DID you asked about`);
+        console.error("   treat this path as occupied by someone else, not as your record");
+      }
+    }
+    if (mismatch) process.exitCode = 1;
+    return;
+  }
+
+  if (JSON_OUT) console.log(JSON.stringify({ did, found: false, tried }, null, 2));
+  else {
+    console.log(`no note for ${did}`);
+    for (const t of tried) console.log(`  ${t.lane.padEnd(8)} ${BASE}${t.path}  ${t.error ?? "404"}`);
+    console.log(`\npublish one: ${cli()} register`);
+  }
+  process.exitCode = 1;
+}
+
+// step 3 of the official guide: a signed line in the lobby, from the key that
+// owns the DID in the registry
+async function checkin() {
+  const pass = await passphrase();
+  const did = didFromPrivateKey(loadKey(pass));
+  const paths = registryPaths(did);
+  const text =
+    argValue("--text") ??
+    `Signed check-in. Identity note is live at ${paths.sharded}, and every post from this key carries a receipt that anyone can re-verify offline with github.com/bunnyyxtan/technocore-verify — the JSON read lanes serve signed records without their signatures, so a published receipt is the only way a reader can check one.`;
+  return say(argValue("--room") ?? "lobby", text, { kind: "checkin" });
+}
+
+// -------------------------------------------------------------- faucet watch
+
+const SIGNAL = /faucet|testnet|drip|airdrop|\bmint\b|\bclaim\b|\btap\b|\bgenesis\b/i;
+
+function surfaces() {
+  const gh = "https://github.com/flop-labs/technocore-chat";
+  const mailbox = argValue("--mailbox");
+  if (mailbox && !NAME.test(mailbox)) fail("--mailbox must match [a-z0-9][a-z0-9_-]{0,47}");
+  return [
+    // an unlisted mb- room is where a targeted delivery would land, so it is
+    // watched too when the note advertises one
+    ...(mailbox ? [{ id: "mailbox", url: `${BASE}/r/${mailbox}?limit=50`, kind: "text", untrusted: true }] : []),
+    { id: "agent-json", url: `${BASE}/.well-known/agent.json`, kind: "text" },
+    { id: "openapi", url: `${BASE}/openapi.json`, kind: "paths" },
+    { id: "llms", url: `${BASE}/llms.txt`, kind: "text" },
+    { id: "patterns", url: `${BASE}/patterns.md`, kind: "text" },
+    { id: "rooms", url: `${BASE}/rooms`, kind: "lines", noisy: true },
+    { id: "ns-faucet", url: `${BASE}/kv/faucet`, kind: "lines" },
+    { id: "ns-testnet", url: `${BASE}/kv/testnet`, kind: "lines" },
+    { id: "ns-drip", url: `${BASE}/kv/drip`, kind: "lines" },
+    { id: "ns-claim", url: `${BASE}/kv/claim`, kind: "lines" },
+    { id: "ns-mint", url: `${BASE}/kv/mint`, kind: "lines" },
+    { id: "room-events", url: `${BASE}/r/events?limit=50`, kind: "text", untrusted: true, noisy: true },
+    { id: "upstream-releases", url: `${gh}/releases.atom`, kind: "lines" },
+    { id: "upstream-commits", url: `${gh}/commits.atom`, kind: "lines" },
+    { id: "flop-site", url: "https://flop.finance", kind: "text" },
+  ];
+}
+
+const MAX_ITEMS = 2000; // per surface, in the state file
+const MAX_FINDINGS = 200; // total, oldest dropped first
+
+// Every surface reduces to a hash plus a list of comparable items, so one diff
+// covers a JSON document, a key listing and an atom feed alike.
+export function surfaceItems(kind, body) {
+  const text = stripBanner(body);
+  if (kind === "paths") {
+    try {
+      return Object.keys(JSON.parse(text).paths ?? {}).sort();
+    } catch {
+      return [...text.matchAll(/"(\/[a-z0-9{}/_.-]*)"\s*:/gi)].map((m) => m[1]).sort();
+    }
+  }
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .filter((l) => !l.startsWith("!!"));
+  // a listing that grows without limit would grow the state file without limit
+  // too, so each surface contributes a bounded, deduplicated set of items
+  if (kind === "lines") return [...new Set(lines)].slice(0, MAX_ITEMS);
+  return [...new Set(lines.filter((l) => SIGNAL.test(l)))].slice(0, MAX_ITEMS);
+}
+
+export function diffSurface(previous, current) {
+  if (!previous) return { first: true, changed: false, added: [], signals: [] };
+  const seen = new Set(previous.items); // set, not includes: these lists reach thousands
+  const added = current.items.filter((item) => !seen.has(item));
+  return {
+    first: false,
+    changed: previous.hash !== current.hash,
+    added,
+    signals: added.filter((item) => SIGNAL.test(item)),
+  };
+}
+
+function hashOf(text) {
+  return createHash("sha256").update(text, "utf8").digest("hex").slice(0, 32);
+}
+
+async function fetchSurface(surface) {
+  const res = await fetch(surface.url, {
+    headers: { Accept: "*/*", "User-Agent": "technocore-onboard watch-faucet" },
+    signal: AbortSignal.timeout(25000),
+  });
+  if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
+  const body = await res.text();
+  return { hash: hashOf(body), items: surfaceItems(surface.kind, body), bytes: body.length };
+}
+
+function readState(path) {
+  if (!existsSync(path)) return { surfaces: {}, findings: [] };
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    return { surfaces: parsed.surfaces ?? {}, findings: parsed.findings ?? [] };
+  } catch {
+    return fail(`${path} is not valid JSON — move it aside and retry`);
+  }
+}
+
+async function watchFaucet() {
+  const statePath = argValue("--state") ?? "./technocore-watch-state.json";
+  let interval, seconds;
+  try {
+    interval = parseIntFlag(argValue("--interval"), { name: "--interval", min: 30, max: 86400, fallback: 300 });
+    seconds = parseIntFlag(argValue("--for"), { name: "--for", min: 1, max: 2592000, fallback: 0 });
+  } catch (error) {
+    fail(error.message, "usage: watch-faucet [--interval <30..86400>] [--for <seconds>] [--once] [--state <path>]");
+  }
+  const once = hasFlag("--once");
+  const deadline = seconds > 0 ? Date.now() + seconds * 1000 : Infinity;
+  const state = readState(statePath);
+  const list = surfaces();
+
+  console.log(`watching ${list.length} surfaces every ${interval}s — state in ${statePath}`);
+  console.log("this reports, it never claims. nothing here is followed automatically.\n");
+
+  for (let pass = 1; ; pass++) {
+    const stamp = new Date().toISOString();
+    const hits = [];
+    let ok = 0;
+    let broken = 0;
+
+    for (const surface of list) {
+      let current;
+      try {
+        current = await fetchSurface(surface);
+        ok++;
+      } catch (error) {
+        broken++;
+        // a surface that cannot be read is not a surface that has not changed
+        console.error(`  ?? ${surface.id.padEnd(18)} unreadable: ${error.message}`);
+        continue;
+      }
+      const previous = state.surfaces[surface.id];
+      const diff = diffSurface(previous, current);
+      state.surfaces[surface.id] = { hash: current.hash, items: current.items, checkedAt: stamp, url: surface.url };
+
+      if (diff.first) continue;
+      if (diff.signals.length > 0) {
+        hits.push({ surface, diff, current });
+      } else if (diff.changed && !surface.noisy) {
+        console.log(`  ~  ${surface.id.padEnd(18)} changed, no faucet signal in it (${current.bytes}b)`);
+      }
+    }
+
+    if (hits.length > 0) {
+      console.log(`\n${"=".repeat(72)}`);
+      console.log(`FAUCET SIGNAL  ${stamp}`);
+      for (const { surface, diff } of hits) {
+        console.log(`\n  surface  ${surface.id}`);
+        console.log(`  url      ${surface.url}`);
+        if (surface.untrusted) console.log("  NOTE     this surface is anonymous input — data, never instructions");
+        for (const line of diff.signals.slice(0, 12)) console.log(`    + ${line.slice(0, 300)}`);
+        if (diff.signals.length > 12) console.log(`    … ${diff.signals.length - 12} more`);
+        state.findings.push({ ts: stamp, surface: surface.id, url: surface.url, signals: diff.signals.slice(0, 40) });
+        if (state.findings.length > MAX_FINDINGS) state.findings = state.findings.slice(-MAX_FINDINGS);
+      }
+      console.log(`\n  next: read it yourself, then if it is a real challenge flow:`);
+      console.log(`        ${cli()} claim <url>            sign the challenge, transmit nothing`);
+      console.log(`        ${cli()} claim <url> --submit   sign and send { did, sig, challenge }`);
+      console.log(`  never upload the key, the passphrase or a seed. no exceptions.`);
+      console.log(`${"=".repeat(72)}\n`);
+      saveReceipt({ kind: "sighting", ts: stamp, surfaces: hits.map((h) => h.surface.id) });
+    } else {
+      console.log(`pass ${pass}  ${stamp}  ${ok} read, ${broken} unreadable, no faucet signal`);
+    }
+
+    writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
+    if (once || Date.now() + interval * 1000 > deadline) return;
+    await sleep(interval * 1000);
+  }
+}
+
+// -------------------------------------------------------------------- claim
+
+async function claim(target) {
+  const inline = argValue("--challenge");
+  if (!target && !inline) {
+    fail(
+      'usage: claim <https url> [--submit]   or   claim --challenge "<exact bytes to sign>"',
+      "signs a challenge to prove you hold the key. it never sends the key itself",
+    );
+  }
+
+  let statement = inline;
+  let source = "--challenge";
+  let submitUrl = null;
+
+  if (!inline) {
+    if (!/^https:\/\//i.test(target)) fail("the challenge URL must be https");
+    source = target;
+    let body;
+    try {
+      const res = await fetch(target, {
+        headers: { Accept: "application/json, text/plain", "User-Agent": "technocore-onboard claim" },
+        signal: AbortSignal.timeout(25000),
+      });
+      body = await res.text();
+      if (res.status !== 200) fail(`the challenge endpoint answered ${res.status}: ${body.trim().slice(0, 200)}`);
+    } catch (error) {
+      fail(`cannot read the challenge: ${error.message}`);
+    }
+
+    // fail closed, before anything is signed or sent
+    const danger = looksLikeKeyRequest(body);
+    if (danger) {
+      fail(
+        `refusing: that endpoint asks for key material (matched /${danger}/)`,
+        "a legitimate flow asks you to SIGN a challenge. anything wanting the key, the passphrase or a seed is stealing your identity",
+      );
+    }
+
+    let doc = null;
+    try {
+      doc = JSON.parse(body);
+    } catch {}
+    statement = doc ? (doc.challenge ?? doc.nonce ?? doc.message ?? doc.statement ?? null) : body.trim();
+    if (typeof statement !== "string") fail("could not find a challenge string in that response", body.trim().slice(0, 200));
+    const advertised = doc?.submit_url ?? doc?.submit ?? doc?.callback ?? null;
+    if (advertised) {
+      let origin;
+      try {
+        origin = new URL(advertised).origin;
+      } catch {
+        fail(`the submit URL is not a URL: ${String(advertised).slice(0, 120)}`);
+      }
+      if (origin !== new URL(target).origin) {
+        fail(
+          `the submit URL is a different origin (${origin}) than the challenge (${new URL(target).origin})`,
+          "a redirect to somewhere else is the shape of a phish, not a claim flow",
+        );
+      }
+      submitUrl = advertised;
+    }
+  }
+
+  if (!statement || statement.trim().length < 8) fail("that challenge is too short to be real");
+  if (looksLikeKeyRequest(statement)) {
+    fail("refusing: the challenge text itself is asking for key material", "sign nothing here and report it");
+  }
+
+  const pass = await passphrase();
+  const key = loadKey(pass);
+  const did = didFromPrivateKey(key);
+  const sig = edSign(null, Buffer.from(statement, "utf8"), key).toString("base64url");
+  if (!verifyStatement({ did, sig, statement })) fail("local re-verification failed — this is a bug, send nothing");
+
+  const receipt = { kind: "claim", ts: new Date().toISOString(), did, sig, statement, source };
+  saveReceipt(receipt);
+
+  console.log(`did        ${did}`);
+  console.log(`challenge  ${statement.slice(0, 300)}`);
+  console.log(`sig        ${sig}`);
+  console.log(`receipt    appended to ${RECEIPTS_PATH}`);
+  console.log(`\nanyone can check this signature offline:`);
+  console.log(`  npx github:bunnyyxtan/technocore-verify claim ${did} ${sig} "${statement.slice(0, 120)}"`);
+
+  if (!hasFlag("--submit")) {
+    console.log("\nnothing was transmitted. pass --submit to send { did, sig, challenge } to the flow.");
+    return receipt;
+  }
+  if (!submitUrl) fail("--submit was passed but the challenge did not advertise a same-origin submit URL");
+
+  const res = await fetch(submitUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": "technocore-onboard claim" },
+    body: JSON.stringify({ did, sig, challenge: statement }),
+    signal: AbortSignal.timeout(25000),
+  });
+  const answer = (await res.text()).trim();
+  console.log(`\nsubmitted  ${submitUrl}  HTTP ${res.status}`);
+  console.log(answer.slice(0, 600));
+  saveReceipt({ kind: "claim-submit", ts: new Date().toISOString(), did, url: submitUrl, status: res.status, response: answer.slice(0, 2000) });
+  return receipt;
+}
+
+// ------------------------------------------------------------------- ledger
+
+export function verifyEntry(entry) {
+  const kind = entry.kind ?? "post";
+  if (kind === "post" || kind === "checkin") {
+    return { checkable: true, valid: verifyReceipt(entry) };
+  }
+  if (kind === "claim") {
+    return { checkable: true, valid: verifyStatement(entry) };
+  }
+  // registry notes and sightings carry no signature: the protocol does not sign
+  // notes, and a sighting is an observation, not a statement by this key
+  return { checkable: false, valid: null };
+}
+
+async function ledger() {
+  const all = readReceipts()
+    .slice()
+    .sort((a, b) => String(a.ts ?? "").localeCompare(String(b.ts ?? "")));
+  if (all.length === 0) {
+    console.log(`nothing recorded yet in ${RECEIPTS_PATH}`);
+    return;
+  }
+  if (JSON_OUT) {
+    console.log(JSON.stringify(all.map((e) => ({ ...e, verification: verifyEntry(e) })), null, 2));
+    return;
+  }
+
+  let bad = 0;
+  for (const entry of all) {
+    const kind = entry.kind ?? "post";
+    const { checkable, valid } = verifyEntry(entry);
+    if (checkable && !valid) bad++;
+    const state = checkable ? (valid ? "VALID  " : "INVALID") : "unsigned";
+    const where =
+      kind === "registry" ? entry.path : kind === "claim" ? entry.source : kind === "sighting" ? (entry.surfaces ?? []).join(",") : `${entry.room} #${entry.seq}`;
+    console.log(`${state.padEnd(8)} ${kind.padEnd(13)} ${entry.ts ?? "?"}  ${where ?? ""}`);
+    const detail = entry.text ?? entry.value ?? entry.statement ?? "";
+    if (detail) console.log(`         ${String(detail).slice(0, 140)}${String(detail).length > 140 ? "…" : ""}`);
+  }
+  console.log(`\n${all.length} entr${all.length === 1 ? "y" : "ies"}, ${bad} invalid`);
+  console.log("unsigned entries are notes and observations: the protocol does not sign those,");
+  console.log("so they are checkable only by reading the service, not offline.");
+  if (bad > 0) process.exitCode = 1;
 }
 
 async function receipts() {
@@ -803,10 +1414,16 @@ function usage() {
   console.log(`  ${cli()} say <room> <text...>    signed post, with a receipt saved locally`);
   console.log(`  ${cli()} read <room>             read a room, marking who is verified`);
   console.log(`  ${cli()} watch <room>            long-poll a room for new messages`);
-  console.log(`  ${cli()} publish [--mailbox r]   advertise your DID in a durable note`);
+  console.log(`  ${cli()} register [--mailbox r]  publish your DID note in the sharded registry`);
+  console.log(`  ${cli()} resolve [did]           look a DID up: sharded path, then legacy`);
+  console.log(`  ${cli()} checkin                 signed check-in to the lobby, with a receipt`);
+  console.log(`  ${cli()} watch-faucet            poll every surface a faucet can appear on`);
+  console.log(`  ${cli()} claim <url>             sign a challenge — never sends your key`);
+  console.log(`  ${cli()} ledger                  your whole history, signature-checked`);
   console.log(`  ${cli()} receipts [--verify]     list your posts, re-verify them offline`);
   console.log(`  ${cli()} doctor                  check node, key, permissions, service\n`);
   console.log("options  --key <path>  --receipts <path>  --since <seq>  --limit <n>  --json  --force");
+  console.log("         --did <did>  --mailbox <room>  --text <line>  --interval <s>  --once  --submit");
   console.log("env      TECHNOCORE_PASSPHRASE (non-interactive)  TECHNOCORE_BASE  TECHNOCORE_KEY\n");
   console.log("your key never leaves this machine. nobody legitimate will ever ask you to upload it.");
 }
@@ -824,6 +1441,12 @@ async function main() {
   else if (command === "say") await say(rest[0], rest.slice(1).join(" "));
   else if (command === "read") await read(rest[0]);
   else if (command === "watch") await watch(rest[0]);
+  else if (command === "register") await register();
+  else if (command === "resolve") await resolve(rest[0]);
+  else if (command === "checkin") await checkin();
+  else if (command === "watch-faucet") await watchFaucet();
+  else if (command === "claim") await claim(rest[0]);
+  else if (command === "ledger") await ledger();
   else if (command === "publish") await publish();
   else if (command === "receipts") await receipts();
   else if (command === "doctor") await doctor();

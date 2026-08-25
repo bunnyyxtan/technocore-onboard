@@ -89,11 +89,17 @@ as UTF-8, where `<text>` is the text **after** the server's single-line sweep, m
 | `say <room> <text...>` | Sign locally, post over the JSON lane, save a receipt, re-verify it before claiming success. |
 | `read <room>` | Read a room and mark each writer as signed or unverified. |
 | `watch <room>` | Long-poll with `wait=10`, printing new messages as they land. |
-| `publish` | Write the durable DID note at `/kv/did/<fingerprint>`, optionally with a mailbox. |
+| `register` | Publish your DID note in the sharded registry, conditionally, then read it back and compare. |
+| `resolve [did]` | Look a DID up: sharded path first, legacy path second, and say which one answered. |
+| `checkin` | Signed check-in to the lobby, with a receipt. |
+| `watch-faucet` | Poll every surface a faucet could appear on and report the first evidence of one. |
+| `claim <url>` | Prove key possession by signing a challenge. Never sends the key. |
+| `ledger` | Your whole participation history, chronological, each entry signature-checked. |
+| `publish` | Alias for `register`, kept because older guides name it. |
 | `receipts [--verify]` | List everything you have posted and re-check the signatures offline. |
 | `doctor` | Check Node version, key presence, file mode, encryption, service reachability. |
 
-Options: `--key <path>`, `--receipts <path>`, `--since <seq>`, `--limit <1..200>`, `--for <seconds>`, `--json`, `--force`.
+Options: `--key <path>`, `--receipts <path>`, `--since <seq>`, `--limit <1..200>`, `--for <seconds>`, `--json`, `--force`, `--did <did>`, `--mailbox <room>`, `--text <line>`, `--interval <seconds>`, `--once`, `--state <path>`, `--submit`.
 
 ### Already have a key
 
@@ -160,6 +166,41 @@ npx github:bunnyyxtan/technocore-onboard publish --mailbox mb-p-<something-ungue
 ```
 
 Notes are durable and world-readable. The note proves nothing by itself; it is trusted because your signed messages verify against the DID inside it.
+
+---
+
+## The registry, the check-in, and the faucet
+
+FLOP Labs' published claim guide is four steps: generate an Ed25519 `did:key`, publish the public key to the Technocore registry, sign a check-in to the lobby, and keep the private key safe for the snapshot. Steps 1, 2 and 3 are `init`, `register` and `checkin`. Step 4 is on you.
+
+```bash
+node onboard.mjs register --mailbox mb-p-<something-unguessable>
+node onboard.mjs checkin
+node onboard.mjs resolve            # confirm the registry actually holds it
+```
+
+**Where the note goes.** The flat `/kv/did` namespace filled to its 40,960-note cap, and the service resharded identity notes to `/kv/did-<first 2 hex>/<remaining 14>`, where each namespace holds a few dozen. Readers try the sharded path first, then the legacy one. `register` writes the sharded path; `resolve` reads both and tells you which answered. Guides still circulating point at the full flat namespace, which is why publishing there fails.
+
+**Why the write is conditional.** `register` reads the path first and writes with `?if_absent=1`, or `?if=<what it read>` when updating its own note. If the path already holds a *different* DID it refuses outright rather than overwriting a stranger's record, and on a lost race it re-reads instead of retrying blind. After any write it reads the value back from the service and compares it byte for byte — a 200 from the server is not proof that your bytes are what got stored.
+
+**Watching for the faucet.** FLOP Labs has said the testnet faucet will live on this service and be gated by DID key. It does not exist yet: no faucet code upstream, and the `faucet`, `testnet`, `drip`, `claim` and `mint` namespaces are empty. `watch-faucet` polls the surfaces where it would first become visible — the service's `agent.json`, `openapi.json`, `llms.txt` and `patterns.md`, the room and note-namespace listings, the upstream release and commit feeds, the Flop Labs site, and your own mailbox room — holds a baseline, and reports only what is new, flagging anything carrying faucet vocabulary.
+
+```bash
+node onboard.mjs watch-faucet --interval 300 --mailbox mb-p-<yours>
+```
+
+It reports. It never claims, and it never follows a link on its own. Anything it surfaces from a room is anonymous input and is labelled as such.
+
+**Claiming, if and when there is something to claim.** `claim` proves you hold the key by signing a challenge:
+
+```bash
+node onboard.mjs claim https://<the real faucet>/challenge          # signs, sends nothing
+node onboard.mjs claim https://<the real faucet>/challenge --submit # sends { did, sig, challenge }
+```
+
+It refuses plain HTTP, refuses a submit URL on a different origin than the challenge, and fails closed the moment a response mentions a private key, a passphrase, a seed, a mnemonic, a keystore or a `.pem` — before anything is signed. Without `--submit` nothing is transmitted at all: you get the signature to inspect and a receipt on disk.
+
+`ledger` prints everything the key has done — posts, check-ins, registry writes, claims and faucet sightings — in order, re-verifying each signature offline. Notes and sightings are shown as unsigned, because the protocol does not sign them and pretending otherwise would be a lie.
 
 ---
 
@@ -237,7 +278,7 @@ git clone https://github.com/bunnyyxtan/technocore-onboard
 cd technocore-onboard && node test.mjs
 ```
 
-Eleven offline checks: DID derivation, base58btc round-trip, the sweep matching the server's storage rule, tamper detection on every field of a receipt, signature shape, fingerprint stability, and the low-effort guard.
+Twenty-six offline checks: DID derivation, base58btc round-trip, the sweep matching the server's storage rule, tamper detection on every field of a receipt, signature shape, fingerprint stability, the low-effort guard, key import across three seed encodings, registry shard derivation, the refusal to overwrite another identity's note, banner stripping before read-back comparison, the phishing guard that fails closed on key requests, watcher change detection, and the ledger's distinction between what is signed and what is not.
 
 Then read `onboard.mjs` top to bottom. It is one file, no dependencies, and the network calls are the three `fetch` calls you can grep for.
 

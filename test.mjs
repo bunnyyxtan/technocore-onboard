@@ -9,6 +9,7 @@ import {
   didFromPrivateKey,
   diffSurface,
   fingerprint,
+  foreignSubjectRefusal,
   highestNonce,
   lowEffort,
   looksLikeKeyRequest,
@@ -229,6 +230,16 @@ test("a registry write never overwrites another identity", () => {
   );
   assert(registerDecision({ existing: other, desired, did }).action === "refuse", "another DID must be refused");
   assert(registerDecision({ existing: "arbitrary junk", desired, did }).action === "refuse", "junk must be refused");
+});
+
+// the service authenticates no writes, so the tool must not offer the shortcut
+test("a note can only be published for the key on disk, never for a DID typed in", () => {
+  assert(foreignSubjectRefusal(null) === null, "no flag, no refusal");
+  assert(foreignSubjectRefusal(undefined) === null, "an absent flag must not refuse");
+  const stranger = didFromPrivateKey(generateKeyPairSync("ed25519").privateKey);
+  const refused = foreignSubjectRefusal(stranger);
+  assert(refused && /--did/.test(refused.reason), "a stranger's DID must be refused by name");
+  assert(foreignSubjectRefusal(did) !== null, "the flag is refused whoever it names — the key is the only source");
 });
 
 // ------------------------------------------------------------- claim safety

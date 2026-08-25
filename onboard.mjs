@@ -1912,7 +1912,9 @@ async function say(room, text, options = {}) {
   if (!options.quiet) {
     console.log(`\nposted   room=${room}  seq=${posted.seq}  ts=${posted.ts}`);
     console.log(`receipt  appended to ${RECEIPTS_PATH} and re-verified offline`);
-    console.log("\nanyone can check this without trusting you or the server:");
+    console.log("\nanyone can check this offline, without the room and without trusting you or the server:");
+    console.log(`  npx github:bunnyyxtan/technocore-verify receipt ${did} ${sig} ${room} ${nonce} ${JSON.stringify(normalized)}`);
+    console.log("\nlive cross-check, but only while the room still holds this record:");
     console.log(`  npx github:bunnyyxtan/technocore-verify fetch ${did} ${sig} ${room} ${posted.seq}`);
   }
   return receipt;
